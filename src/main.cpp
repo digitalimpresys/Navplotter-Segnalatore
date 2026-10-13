@@ -25,8 +25,29 @@
 #include "traffic_packet.h"
 #include "web_page.h"
 
-#define FIRMWARE_VERSION "0.6.1"
+#define FIRMWARE_VERSION "0.6.2"
 
+// Two boards: the Heltec WiFi LoRa 32 V3 (ESP32-S3, SX1262 radio) and the older V2 (ESP32, SX1276 radio).
+// The V2 is chosen with -DBOARD_HELTEC_V2 (environment heltec_wifi_lora_32_V2 in platformio.ini).
+#ifdef BOARD_HELTEC_V2
+// ---- Heltec WiFi LoRa 32 V2 pins ----
+#define PIN_LORA_NSS 18
+#define PIN_LORA_SCK 5
+#define PIN_LORA_MOSI 27
+#define PIN_LORA_MISO 19
+#define PIN_LORA_RST 14
+#define PIN_LORA_DIO0 26
+#define PIN_LORA_DIO1 35
+#define PIN_OLED_SDA 4
+#define PIN_OLED_SCL 15
+#define PIN_OLED_RST 16
+#define PIN_VEXT 21      // LOW = display power on
+#define PIN_GPS_TX 17    // board TX -> GPS RX
+#define PIN_GPS_RX 23    // board RX <- GPS TX
+#define PIN_BUTTON 0     // the PRG key: wakes a sleeping buoy for set-up
+#define PIN_LED 25       // white LED: shows what a sleeping buoy does at each wake-up
+#define LORA_POWER_DBM 20 // the most the SX1276 gives
+#else
 // ---- Heltec WiFi LoRa 32 V3 pins ----
 #define PIN_LORA_NSS 8
 #define PIN_LORA_SCK 9
@@ -50,9 +71,10 @@
 #define PIN_SD_SCK 5
 #define PIN_SD_MOSI 6
 #define PIN_SD_MISO 7
+#define LORA_POWER_DBM 22
+#endif
 
 // ---- Radio and traffic ----
-#define LORA_POWER_DBM 22
 #define LORA_TX_MOVING_MS 10000UL
 #define LORA_TX_STOPPED_MS 30000UL
 #define MOVING_MIN_KNOTS 0.5
@@ -122,8 +144,12 @@ struct Target {
 Config config;
 Preferences prefs;
 WebServer server(80);
+#ifdef BOARD_HELTEC_V2
+SX1276 radio = new Module(PIN_LORA_NSS, PIN_LORA_DIO0, PIN_LORA_RST, PIN_LORA_DIO1);
+#else
 SX1262 radio = new Module(PIN_LORA_NSS, PIN_LORA_DIO1, PIN_LORA_RST, PIN_LORA_BUSY);
 SPIClass sdSpi(HSPI);
+#endif
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, PIN_OLED_RST, PIN_OLED_SCL, PIN_OLED_SDA);
 TinyGPSPlus gps;
 
@@ -202,12 +228,16 @@ bool staConnected() {
 }
 
 float batteryVolts() {
+#ifdef BOARD_HELTEC_V2
+  return 0; // not measured on the V2 (its revisions wire the battery differently): the web app shows "-"
+#else
   digitalWrite(PIN_BAT_CTRL, LOW);
   delay(2);
   uint32_t sum = 0;
   for(int i = 0; i < 8; i++) sum += analogReadMilliVolts(PIN_BAT_ADC);
   digitalWrite(PIN_BAT_CTRL, HIGH);
   return sum / 8 * 4.9 / 1000.0; // the divider on the board is 390k/100k
+#endif
 }
 
 // ============================================
@@ -294,7 +324,7 @@ void detectGpsBaud() {
       return;
     }
   }
-  Serial.println("GPS not found on pins 47/48");
+  Serial.printf("GPS not found: its TX wire goes to pin %d\n", PIN_GPS_RX);
 }
 
 void readGps() {
@@ -317,6 +347,16 @@ void IRAM_ATTR onRadioIrq() {
 
 void initRadio() {
   SPI.begin(PIN_LORA_SCK, PIN_LORA_MISO, PIN_LORA_MOSI, PIN_LORA_NSS);
+#ifdef BOARD_HELTEC_V2
+  // SX1276: no TCXO and no antenna switch to set up; "done" for both sending and receiving comes on DIO0
+  int state = radio.begin(LORA_FREQ, LORA_BW, LORA_SF, LORA_CR, LORA_SYNC, LORA_POWER_DBM, LORA_PREAMBLE, 0);
+  if(state == RADIOLIB_ERR_NONE) {
+    radio.setCurrentLimit(140);
+    radio.setCRC(true);
+    radio.setDio0Action(onRadioIrq, RISING);
+    radioOk = radio.startReceive() == RADIOLIB_ERR_NONE;
+  }
+#else
   // The Heltec V3 powers the radio TCXO from DIO3 at 1.8 V and switches the antenna with DIO2
   int state = radio.begin(LORA_FREQ, LORA_BW, LORA_SF, LORA_CR, LORA_SYNC, LORA_POWER_DBM, LORA_PREAMBLE, 1.8);
   if(state == RADIOLIB_ERR_NONE) {
@@ -328,6 +368,8 @@ void initRadio() {
     radio.setDio1Action(onRadioIrq);
     radioOk = radio.startReceive() == RADIOLIB_ERR_NONE;
   }
+#endif
+  if(state != RADIOLIB_ERR_NONE) Serial.printf("LoRa start failed (%d)\n", state);
   nextTx = millis() + 5000 + random(0, 3000);
   Serial.printf("LoRa %s: %.3f MHz, SF%d, %d dBm\n", radioOk ? "ready" : "NOT available", LORA_FREQ, LORA_SF, LORA_POWER_DBM);
 }
@@ -873,6 +915,7 @@ void initWeb() {
 
 void drawDisplay() {
   static unsigned long last = 0;
+  if(!oledOn) return;
   if(millis() - last < 1000) return;
   last = millis();
 
@@ -942,8 +985,10 @@ void setup() {
   Serial.begin(115200);
   delay(300);
 
+#ifndef BOARD_HELTEC_V2
   pinMode(PIN_BAT_CTRL, OUTPUT);
   digitalWrite(PIN_BAT_CTRL, HIGH);
+#endif
   gpio_hold_dis((gpio_num_t)PIN_VEXT);
   gpio_deep_sleep_hold_dis();
   pinMode(PIN_VEXT, OUTPUT);
@@ -958,13 +1003,25 @@ void setup() {
     loadConfig();
     if(esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER && buoyMode()) buoyCycle();
   }
-  oled.begin();
-  oledOn = true;
-  oled.clearBuffer();
-  oled.setFont(u8g2_font_6x10_tf);
-  oled.drawStr(0, 12, "Segnalatore " FIRMWARE_VERSION);
-  oled.drawStr(0, 30, "Starting...");
-  oled.sendBuffer();
+  // The display is asked whether it is there before it is started: with a missing or broken one the
+  // display library would wait for ever, and the node must work without it too
+  pinMode(PIN_OLED_RST, OUTPUT);
+  digitalWrite(PIN_OLED_RST, LOW); delay(20);
+  digitalWrite(PIN_OLED_RST, HIGH); delay(20);
+  Wire.begin(PIN_OLED_SDA, PIN_OLED_SCL);
+  Wire.beginTransmission(0x3C);
+  oledOn = Wire.endTransmission() == 0;
+  Wire.end();
+  if(oledOn) {
+    oled.begin();
+    oled.clearBuffer();
+    oled.setFont(u8g2_font_6x10_tf);
+    oled.drawStr(0, 12, "Segnalatore " FIRMWARE_VERSION);
+    oled.drawStr(0, 30, "Starting...");
+    oled.sendBuffer();
+  } else {
+    Serial.println("Display not found: working without it");
+  }
 
   uint64_t mac = ESP.getEfuseMac();
   myId = (uint32_t)(mac >> 16) ^ (uint32_t)mac;
@@ -975,9 +1032,11 @@ void setup() {
   if(!fsOk) Serial.println("Internal storage not available");
 
   // Optional SD card with chart tiles
+#ifndef BOARD_HELTEC_V2
   sdSpi.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
   sdOk = SD.begin(PIN_SD_CS, sdSpi, 20000000U);
   Serial.println(sdOk ? "SD card ready" : "SD card not present");
+#endif
 
   initRadio();
   initWeb();

@@ -109,3 +109,13 @@ The web app is `web/index.html`; `tools/embed_web.py` compresses it into `src/we
 ## Not done yet
 
 SD card tiles tested on real hardware, NMEA output for other navigation apps.
+
+## Heltec WiFi LoRa 32 V2
+
+The same firmware runs on the older V2 (ESP32, SX1276 radio, 20 dBm), which talks on the air with all the other NavPlotters:
+
+```
+~/.platformio/penv/bin/pio run -e heltec_wifi_lora_32_V2 -t upload
+```
+
+Differences from the V3: the GPS goes on other pins (GPS TX -> pin 23, GPS RX -> pin 17, optional), the battery voltage is not measured, there is no SD card module. If the display does not answer the node works without it. Tried on one board: start-up, radio reception, WiFi; the display of that board did not answer, so the display on a V2 has not been seen working.
